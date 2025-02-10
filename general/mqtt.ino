@@ -7,14 +7,15 @@ const char* ssid = "Growa";
 const char* password = "Montblanc89!";
 
 // Configurazione MQTT
-const char* mqtt_server = "mqtt.growa.ai";  // Indirizzo del tuo broker
-const int mqtt_port = 8883;               // Porta SSL
+const char* mqtt_server = "mqtt.growa.ai";
+const int mqtt_port = 8883;
 const char* mqtt_username = "mqttroot";
 const char* mqtt_password = "k<V<k3:n73mQCF7";
 
 // Topic MQTT per test
 const char* mqtt_topic_pub = "test/message";
-const char* mqtt_topic_sub = "test/response";
+const char* mqtt_topic_sub1 = "test/message";    // Aggiunto primo topic
+const char* mqtt_topic_sub2 = "test/response";   // Secondo topic
 
 WiFiClientSecure espClient;
 PubSubClient client(espClient);
@@ -39,8 +40,10 @@ void reconnect() {
     
     if (client.connect(clientId.c_str(), mqtt_username, mqtt_password)) {
       Serial.println("connesso");
+      // Sottoscrizione a entrambi i topic
+      client.subscribe(mqtt_topic_sub1);
+      client.subscribe(mqtt_topic_sub2);
       client.publish(mqtt_topic_pub, "ESP32 Online");
-      client.subscribe(mqtt_topic_sub);
     } else {
       Serial.print("fallito, rc=");
       Serial.print(client.state());
