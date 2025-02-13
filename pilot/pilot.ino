@@ -1,481 +1,425 @@
-/**
- * Growa Pilot - ESP32 Control System
- * Version 1.0.5
- * Part 1: Includes and Global Definitions
- */
-
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
-#include <Wire.h>
-#include <Adafruit_MCP23X17.h>
-#include <driver/adc.h>
 #include <WiFiManager.h>
-#include <ArduinoJson.h>
+#include <DNSServer.h>
+#include <WebServer.h>
+#include <Adafruit_MCP23X17.h>
 #include <esp_task_wdt.h>
-#include <map>
 
-// Device identification
-#define DEVICE_NAME "GrowaPilot"
-#define FIRMWARE_VERSION "1.0.5"
-
-// Watchdog configuration
-#define WDT_TIMEOUT_SECONDS 30   // 30 seconds watchdog timeout
-
-// MQTT Configuration
+// MQTT configuration
 const char* mqtt_server = "mqtt.growa.ai";
-const int mqtt_port = 1883;
+const int mqtt_port = 8883;
 const char* mqtt_user = "mqttroot";
 const char* mqtt_password = "k<V<k3:n73mQCF7";
 
-// GPIO Pin Definitions
+// Device configuration
+#define DEVICE_ID "0001"
+#define FIRMWARE_VERSION "1.0.7"
+
+// Hardware pins
 #define BATTERY_PIN 32
 #define RELAY_5V_PIN 33
 #define RELAY_3V3_PIN 19
 #define MCP_FEEDBACK_PIN 14
 #define DEBUG_RX 26
 #define DEBUG_TX 27
+#define LED_BUILTIN 2
 
-// Hardware definitions
-const uint8_t MCP23017_ADDRESS = 0x20;
-const uint8_t ADC_PINS[] = {36, 39, 34, 35};    // ADC input pins
-const uint8_t PULSE_PINS[] = {17, 16};          // Pulse counter pins
-
-// MCP23017 Pin Definitions
-#define LED_BLINK_PIN 8
-#define MCP_FEEDBACK_GPB7 7
-#define MCP_WATCHDOG_GPA7 15
-
-// Device types
-enum DeviceType {
-    TYPE_ADC,
-    TYPE_PULSE,
-    TYPE_I2C,
-    TYPE_BOARD
-};
-
-// Device status structure
-struct DeviceStatus {
-    bool configured = false;
-    bool enabled = false;
-    bool initialized = false;
-    DeviceType type = TYPE_BOARD;
-    String value = "";
-    uint32_t lastReading = 0;
-};
-
-// Global Objects
-WiFiManager wifiManager;
-WiFiClient espClient;
+// Global objects
+WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
+WiFiManager wifiManager;
 Adafruit_MCP23X17 mcp;
-HardwareSerial SerialExt(2);
+volatile bool watchdogFlag = false;
 
-// Device management - moved to global scope to resolve scoping issues
-std::map<String, DeviceStatus> devices;
+// Global variables
+char systemTopic[50];
+char configTopic[50];
+int counter = 0;
+int lastMsg = 0;
 
-// Timing variables
-uint32_t readingInterval = 60000;    // Default 60s
-uint32_t pollingInterval = 10000;    // Default 10s
-uint32_t lastReading = 0;
-uint32_t lastWatchdogToggle = 0;
-bool watchdogState = false;
-bool mcpResponding = false;
+const uint8_t MCP23017_ADDRESS = 0x20;
+uint8_t mcpStateA = 0;
+uint8_t mcpStateB = 0;
+unsigned long lastBlinkTime = 0;
+bool blinkState = false;
+bool feedbackState = false;
 
-// Pulse counter variables
-volatile uint32_t pulseCount0 = 0;
+// Mapping dei relay ai pin MCP23017
+const uint8_t RELAY_TO_PIN[] = {
+   9,   // Relay 1 -> GPB1 (pin 9)
+   10,  // Relay 2 -> GPB2 (pin 10)
+   11,  // Relay 3 -> GPB3 (pin 11)
+   12,  // Relay 4 -> GPB4 (pin 12)
+   13,  // Relay 5 -> GPB5 (pin 13)
+   14,  // Relay 6 -> GPB6 (pin 14)
+   1,   // Relay 7 -> GPA1 (pin 1)
+   2,   // Relay 8 -> GPA2 (pin 2)
+   3,   // Relay 9 -> GPA3 (pin 3)
+   4,   // Relay 10 -> GPA4 (pin 4)
+   5,   // Relay 11 -> GPA5 (pin 5)
+   6    // Relay 12 -> GPA6 (pin 6)
+};
+
+const uint8_t ADC_PINS[] = {36, 39, 34, 35};
+const char* ADC_VOLTAGE[4] = {"", "", "", ""};
+
+const uint8_t PULSE_PINS[] = {17, 16};
 volatile uint32_t pulseCount1 = 0;
+volatile uint32_t pulseCount2 = 0;
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
-// Forward declarations
-void handleMqttMessage(char* topic, byte* payload, unsigned int length);
-void connectMQTT();
-void readSensors();
-void handleMCPWatchdog();
-void initializeDeviceMaps();
+#define WDT_TIMEOUT 60  // Timeout in secondi
+hw_timer_t *timer = NULL;
 
-// Debug Functions
-void debug_print(const char* message) {
-    Serial.print(message);
-    SerialExt.print(message);
+void IRAM_ATTR resetModule() {
+    ets_printf("Watchdog timer expired - rebooting\n");
+    esp_restart();
 }
 
-void debug_println(const char* message) {
-    Serial.println(message);
-    SerialExt.println(message);
-}
-
-// Interrupt Handlers
-void IRAM_ATTR pulse0_isr() {
-    pulseCount0++;
-}
-
-void IRAM_ATTR pulse1_isr() {
-    pulseCount1++;
-}
-
-/**
- * Initialize MCP23017
- * All pins configured as outputs
- */
-bool initializeMCP23017(const String& deviceName) {
-    if (!mcp.begin_I2C(MCP23017_ADDRESS)) {
-        debug_println("MCP23017 initialization failed");
-        return false;
-    }
-    
-    pinMode(MCP_FEEDBACK_PIN, INPUT);
-
-    // Configure all MCP pins as outputs
-    for(uint8_t i = 0; i < 16; i++) {
-        mcp.pinMode(i, OUTPUT);
-        mcp.digitalWrite(i, LOW);
-    }
-    
-    devices[deviceName].initialized = true;
-    debug_println("MCP23017 initialized successfully");
-    return true;
-}
-
-/**
- * Initialize ADC
- */
-bool initializeADC(const String& deviceName) {
-    int pin = deviceName.substring(4).toInt();
-    
-    adc1_config_width(ADC_WIDTH_BIT_12);
-    
-    adc1_channel_t channel;
-    switch(pin) {
-        case 36: channel = ADC1_CHANNEL_0; break;
-        case 39: channel = ADC1_CHANNEL_3; break;
-        case 34: channel = ADC1_CHANNEL_6; break;
-        case 35: channel = ADC1_CHANNEL_7; break;
-        default: return false;
-    }
-    
-    adc1_config_channel_atten(channel, ADC_ATTEN_DB_11);
-    devices[deviceName].initialized = true;
-    return true;
-}
-
-/**
- * Initialize Pulse Counter
- */
-bool initializePulseCounter(const String& deviceName) {
-    if(deviceName == "PULSE_0") {
-        pinMode(PULSE_PINS[0], INPUT);
-        attachInterrupt(digitalPinToInterrupt(PULSE_PINS[0]), pulse0_isr, FALLING);
-    }
-    else if(deviceName == "PULSE_1") {
-        pinMode(PULSE_PINS[1], INPUT);
-        attachInterrupt(digitalPinToInterrupt(PULSE_PINS[1]), pulse1_isr, FALLING);
-    }
-    else {
-        return false;
-    }
-    
-    devices[deviceName].initialized = true;
-    return true;
-}
-
-/**
- * Initialize all devices
- */
-void initializeDeviceMaps() {
-    // Initialize Board
-    DeviceStatus boardStatus;
-    boardStatus.enabled = true;
-    boardStatus.configured = true;
-    boardStatus.initialized = true;
-    boardStatus.type = TYPE_BOARD;
-    devices["BOARD"] = boardStatus;
-    
-    // Initialize ADC channels
-    for(uint8_t i = 0; i < sizeof(ADC_PINS); i++) {
-        String deviceName = "ADC_" + String(ADC_PINS[i]);
-        DeviceStatus adcStatus;
-        adcStatus.enabled = true;
-        adcStatus.configured = true;
-        adcStatus.type = TYPE_ADC;
-        devices[deviceName] = adcStatus;
-        initializeADC(deviceName);
-    }
-    
-    // Initialize Pulse counters
-    for(uint8_t i = 0; i < sizeof(PULSE_PINS); i++) {
-        String deviceName = "PULSE_" + String(i);
-        DeviceStatus pulseStatus;
-        pulseStatus.enabled = true;
-        pulseStatus.configured = true;
-        pulseStatus.type = TYPE_PULSE;
-        devices[deviceName] = pulseStatus;
-        initializePulseCounter(deviceName);
-    }
-    
-    // Initialize MCP23017
-    DeviceStatus mcpStatus;
-    mcpStatus.enabled = true;
-    mcpStatus.configured = true;
-    mcpStatus.type = TYPE_I2C;
-    devices["MCP23017"] = mcpStatus;
-    initializeMCP23017("MCP23017");
-}
-
-// Separate battery voltage reading function
-float readBatteryVoltage() {
-    return analogRead(BATTERY_PIN) * (20.0 / 4095.0);  // Scale to 0-20V range
-}
-
-/**
- * Growa Pilot - ESP32 Control System
- * Version 1.0.5
- * Part 2: Core Functionality and Main Program Flow
- */
-
-// This file should be included after part1 with all previous definitions
-
-/**
- * Handle MCP23017 watchdog and feedback
- */
-void handleMCPWatchdog() {
-    if (millis() - lastWatchdogToggle >= pollingInterval) {
-        watchdogState = !watchdogState;
-        
-        if(devices["MCP23017"].enabled) {
-            mcp.digitalWrite(MCP_FEEDBACK_GPB7, watchdogState);
-            mcp.digitalWrite(MCP_WATCHDOG_GPA7, watchdogState);
-            
-            delay(1);
-            bool feedback = digitalRead(MCP_FEEDBACK_PIN);
-            if(feedback != watchdogState) {
-                mcpResponding = false;
-                debug_println("MCP feedback mismatch");
-            } else {
-                mcpResponding = true;
-            }
-        }
-        
-        lastWatchdogToggle = millis();
-    }
-}
-
-/**
- * Publish device reading
- */
-void publishReading(const String& device) {
-    if (!devices[device].enabled) return;
-    
-    JsonDocument doc;
-    doc["device"] = device;
-    doc["type"] = devices[device].type;
-    
-    switch(devices[device].type) {
-        case TYPE_ADC: {
-            int pin = device.substring(4).toInt();
-            float voltage = analogRead(pin) * 3.3 / 4095.0;
-            doc["address"] = String(pin);
-            doc["value"] = String(voltage, 2);
-            break;
-        }
-        case TYPE_PULSE: {
-            int pulseIndex = device.substring(6).toInt();
-            uint32_t count = (pulseIndex == 0) ? pulseCount0 : pulseCount1;
-            doc["address"] = String(PULSE_PINS[pulseIndex]);
-            doc["value"] = String(count);
-            break;
-        }
-        case TYPE_I2C: {
-            if (device == "MCP23017") {
-                uint16_t state = mcp.readGPIOAB();
-                char stateStr[13];
-                for (int i = 0; i < 12; i++) {
-                    stateStr[i] = (state & (1 << i)) ? '1' : '0';
-                }
-                stateStr[12] = '\0';
-                doc["address"] = "0x20";
-                doc["value"] = stateStr;
-            }
-            break;
-        }
-        case TYPE_BOARD: {
-            float battery = readBatteryVoltage();
-            doc["firmware"] = FIRMWARE_VERSION;
-            doc["battery"] = String(battery, 2);
-            doc["rssi"] = String(WiFi.RSSI());
-            doc["net"] = "WiFi(" + WiFi.SSID() + ")";
-            break;
-        }
-    }
-    
-    String jsonString;
-    serializeJson(doc, jsonString);
-    mqttClient.publish("GrowaPilot/readings", jsonString.c_str(), true);
-}
-
-/**
- * Read and publish all sensors
- */
-void readSensors() {
-    publishReading("BOARD");
-    
-    for(uint8_t pin : ADC_PINS) {
-        publishReading("ADC_" + String(pin));
-    }
-    
-    publishReading("PULSE_0");
-    publishReading("PULSE_1");
-    
-    publishReading("MCP23017");
-}
-
-/**
- * Handle MQTT messages
- */
-void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
-    payload[length] = '\0';
-    String topicStr = String(topic);
-    
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, payload);
-    if (error) {
-        debug_println("JSON parsing failed");
-        return;
-    }
-    
-    if (topicStr.startsWith("GrowaPilot/system")) {
-        String command = doc["command"];
-        
-        if (command == "reset") {
-            ESP.restart();
-        }
-        else if (command == "timing") {
-            readingInterval = doc["value"].as<uint32_t>();
-        }
-        else if (command == "polling") {
-            pollingInterval = doc["value"].as<uint32_t>();
-        }
-    }
-    else if (topicStr.startsWith("GrowaPilot/config")) {
-        if (doc["device"] == "MCP23017" && doc.containsKey("value")) {
-            String value = doc["value"];
-            uint16_t outputs = 0;
-            
-            for (int i = 0; i < 12; i++) {
-                if (value[i] == '1') {
-                    outputs |= (1 << i);
-                }
-            }
-            
-            uint16_t currentState = mcp.readGPIOAB();
-            outputs |= (currentState & 0xC000);
-            
-            mcp.writeGPIOAB(outputs);
-            debug_println("Updated relay states");
-        }
-    }
-}
-
-/**
- * Connect to MQTT broker
- */
-void connectMQTT() {
-    int attempts = 0;
-    while (!mqttClient.connected() && attempts < 3) {  // Limit connection attempts
-        debug_print("Connecting to MQTT...");
-        if (mqttClient.connect(DEVICE_NAME, mqtt_user, mqtt_password)) {
-            debug_println("connected");
-            mqttClient.subscribe("GrowaPilot/config/#");
-            mqttClient.subscribe("GrowaPilot/system/#");
-            break;
-        } else {
-            debug_println("failed, retrying in 5s");
-            delay(5000);
-            attempts++;
-        }
-        esp_task_wdt_reset();  // Reset watchdog during connection attempts
-    }
-}
-
-/**
- * Comprehensive Setup Function
- */
-void setup() {
-    // Initialize serial communications
-    Serial.begin(115200);
-    SerialExt.begin(115200, SERIAL_8N1, DEBUG_RX, DEBUG_TX);
-    
-    debug_println("Growa Pilot starting...");
-    
-    // Configure ESP32 watchdog
+void setupWatchdog() {
+    // Configura il watchdog
     esp_task_wdt_config_t wdt_config = {
-        .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
-        .idle_core_mask = 0,
+        .timeout_ms = WDT_TIMEOUT * 1000,
+        .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
         .trigger_panic = true
     };
     esp_task_wdt_init(&wdt_config);
-    esp_task_wdt_add(NULL);                // Add current task to watchdog
+    esp_task_wdt_add(NULL);  // Aggiungi il task corrente al WDT
     
-    pinMode(RELAY_5V_PIN, OUTPUT);
-    pinMode(RELAY_3V3_PIN, OUTPUT);
-    digitalWrite(RELAY_5V_PIN, LOW);
-    digitalWrite(RELAY_3V3_PIN, LOW);
-    
-    // WiFiManager configuration
-    wifiManager.setConfigPortalTimeout(180);  // 3 minutes timeout for config portal
-    wifiManager.autoConnect("GROWA PILOT");
-    
-    esp_task_wdt_reset();  // Reset watchdog after WiFi connection
-    
-    mqttClient.setServer(mqtt_server, mqtt_port);
-    mqttClient.setCallback(handleMqttMessage);
-    mqttClient.setBufferSize(1024);
-    
-    initializeDeviceMaps();
-    
-    debug_println("Initialization complete");
-    esp_task_wdt_reset();
+    // Configura il timer hardware come backup
+    timer = timerBegin(1000000);  // 1MHz
+    timerAttachInterrupt(timer, &resetModule);
+    timerStart(timer);
 }
 
-/**
- * Main Program Loop
- */
+void feedWatchdog() {
+    esp_task_wdt_reset();  // Reset del watchdog
+    timerWrite(timer, 0);  // Reset del timer hardware
+}
+
+// Callback functions
+void saveConfigCallback() {
+   Serial.println("Configuration saved");
+}
+
+void configModeCallback(WiFiManager *myWiFiManager) {
+   Serial.println("Entered config mode");
+   Serial.println(WiFi.softAPIP());
+   Serial.println(myWiFiManager->getConfigPortalSSID());
+}
+
+// Interrupt handlers
+void IRAM_ATTR pulse1_isr() {
+   portENTER_CRITICAL_ISR(&mux);
+   pulseCount1++;
+   if (pulseCount1 >= UINT32_MAX) {
+       pulseCount1 = 0;
+   }
+   portEXIT_CRITICAL_ISR(&mux);
+}
+
+void IRAM_ATTR pulse2_isr() {
+   portENTER_CRITICAL_ISR(&mux);
+   pulseCount2++;
+   if (pulseCount2 >= UINT32_MAX) {
+       pulseCount2 = 0;
+   }
+   portEXIT_CRITICAL_ISR(&mux);
+}
+
+// MCP23017 functions
+void initMCP23017() {
+   if (!mcp.begin_I2C(MCP23017_ADDRESS)) {
+       Serial.println("Error initializing MCP23017");
+       char errorMsg[] = "0x30+0+1+1";
+       mqttClient.publish(
+           (String(DEVICE_ID) + "/readings").c_str(),
+           (const uint8_t*)errorMsg,
+           strlen(errorMsg),
+           true
+       );
+       return;
+   }
+   for(int i = 0; i < 16; i++) {
+       mcp.pinMode(i, OUTPUT);
+       mcp.digitalWrite(i, LOW);
+   }
+}
+
+void handleMCPConfig(byte* payload, unsigned int length) {
+   char payloadCopy[50];
+   memcpy(payloadCopy, payload, length);
+   payloadCopy[length] = '\0';
+   
+   char* token = strtok(payloadCopy, "+");
+   if (token == NULL || strcmp(token, "0x30") != 0) return;
+   
+   token = strtok(NULL, "+");
+   if (token == NULL || token[0] != '0') return;
+   
+   token = strtok(NULL, "+");
+   if (token == NULL || strcmp(token, "12") != 0) return;
+   
+   uint8_t values[12];
+   bool valid = true;
+   
+   for(int relay = 0; relay < 12 && valid; relay++) {
+       token = strtok(NULL, "+");
+       if(token == NULL) {
+           valid = false;
+           break;
+       }
+       uint8_t value = atoi(token);
+       if(value > 1) {
+           valid = false;
+           break;
+       }
+       values[relay] = value;
+   }
+   
+   if(valid) {
+       for(int relay = 0; relay < 12; relay++) {
+           mcp.digitalWrite(RELAY_TO_PIN[relay], values[relay]);
+       }
+   }
+}
+
+void MCPReading() {
+   Wire.beginTransmission(MCP23017_ADDRESS);
+   if(Wire.endTransmission() != 0) {
+       char errorMsg[] = "0x30+0+1+1";
+       mqttClient.publish(
+           (String(DEVICE_ID) + "/readings").c_str(),
+           (const uint8_t*)errorMsg,
+           strlen(errorMsg),
+           true
+       );
+       return;
+   }
+
+   char outputBuffer[50];
+   char tempBuffer[10];
+   sprintf(outputBuffer, "0x30+0+12");
+   
+   for(int relay = 0; relay < 12; relay++) {
+       int pinState = mcp.digitalRead(RELAY_TO_PIN[relay]);
+       sprintf(tempBuffer, "+%d", pinState);
+       strcat(outputBuffer, tempBuffer);
+   }
+   
+   mqttClient.publish(
+       (String(DEVICE_ID) + "/readings").c_str(),
+       (const uint8_t*)outputBuffer,
+       strlen(outputBuffer),
+       true
+   );
+}
+
+void handleMCPBlink() {
+   unsigned long currentTime = millis();
+   static unsigned long lastBlinkTime = 0;
+   static bool blinkState = false;
+   static bool feedbackState = false;
+   
+   if(currentTime - lastBlinkTime >= 10000) {
+       blinkState = true;
+       feedbackState = true;
+       mcp.digitalWrite(8, HIGH);
+       mcp.digitalWrite(15, HIGH);
+       mcp.digitalWrite(7, HIGH);
+       lastBlinkTime = currentTime;
+   }
+   else if(currentTime - lastBlinkTime >= 2000 && blinkState) {
+       blinkState = false;
+       mcp.digitalWrite(8, LOW);
+   }
+   else if(currentTime - lastBlinkTime >= 1000 && feedbackState) {
+       feedbackState = false;
+       mcp.digitalWrite(15, LOW);
+       mcp.digitalWrite(7, LOW);
+   }
+}
+
+// Sensor reading functions
+void ADCReading() {
+   char outputBuffer[50];    
+   char tempBuffer[10];      
+   const char type[] = "0x20";
+   const char address = '0';
+   
+   sprintf(outputBuffer, "%s+%c+4", type, address);
+   
+   for(int i = 0; i < 4; i++) {
+       float voltage = analogRead(ADC_PINS[i]) * 10.0 / 4095.0;
+       dtostrf(voltage, 1, 2, tempBuffer);
+       
+       char *ptr = tempBuffer;
+       while(*ptr == ' ') ptr++;
+       
+       strcat(outputBuffer, "+");
+       strcat(outputBuffer, ptr);
+   }
+   
+   mqttClient.publish(
+       (String(DEVICE_ID) + "/readings").c_str(),            
+       (const uint8_t*)outputBuffer, 
+       strlen(outputBuffer), 
+       true
+   );
+}
+
+void PULSEReading() {
+   char outputBuffer[50];    
+   char tempBuffer[10];      
+   const char type[] = "0x10";
+   const char address = '0';
+   
+   sprintf(outputBuffer, "%s+%c+2", type, address);
+   
+   portENTER_CRITICAL(&mux);
+   uint32_t count1 = pulseCount1;
+   uint32_t count2 = pulseCount2;
+   portEXIT_CRITICAL(&mux);
+   
+   sprintf(tempBuffer, "%lu", count1);
+   strcat(outputBuffer, "+");
+   strcat(outputBuffer, tempBuffer);
+   
+   sprintf(tempBuffer, "%lu", count2);
+   strcat(outputBuffer, "+");
+   strcat(outputBuffer, tempBuffer);
+   
+   mqttClient.publish(
+       (String(DEVICE_ID) + "/readings").c_str(),            
+       (const uint8_t*)outputBuffer, 
+       strlen(outputBuffer), 
+       true
+   );
+}
+
+// MQTT functions
+void callback(char* topic, byte* payload, unsigned int length) {
+   Serial.print("Message arrived [");
+   Serial.print(topic);
+   Serial.print("] Payload: ");
+   
+   String topicStr = String(topic);
+   String configTopic = String(DEVICE_ID) + "/config";
+   String systemTopic = String(DEVICE_ID) + "/system";
+   String readingsTopic = String(DEVICE_ID) + "/readings";
+   
+   for (int i = 0; i < length; i++) {
+       Serial.print((char)payload[i]);
+   }
+   Serial.println();
+
+   payload[length] = '\0';
+   
+   if(topicStr == configTopic) {
+       char* payloadStr = (char*)payload;
+       char* typeToken = strtok(payloadStr, "+");
+       
+       if(typeToken != NULL && strcmp(typeToken, "0x30") == 0) {
+           handleMCPConfig(payload, length);
+       }
+   }
+   else if(topicStr == systemTopic) {
+       char* payloadStr = (char*)payload;
+       if(strcmp(payloadStr, "reset") == 0) {
+           ESP.restart();
+       }
+   }
+   else if(topicStr == readingsTopic) {
+       char* payloadStr = (char*)payload;
+       char* typeToken = strtok(payloadStr, "+");
+       
+       if(typeToken != NULL) {
+           if(strcmp(typeToken, "0x10") == 0) {
+               Serial.println("Received PULSE reading");
+           }
+           else if(strcmp(typeToken, "0x20") == 0) {
+               Serial.println("Received ADC reading");
+           }
+           else if(strcmp(typeToken, "0x30") == 0) {
+               Serial.println("Received MCP status");
+           }
+       }
+   }
+}
+
+void reconnect() {
+   while (!mqttClient.connected()) {
+       Serial.print("Attempting MQTT connection...");
+       
+       String clientId = "ESP32Client-";
+       clientId += String(random(0xffff), HEX);
+       
+       if (mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_password)) {
+           Serial.println("connected");
+           mqttClient.subscribe((String(DEVICE_ID) + "/system").c_str(), 1);
+           mqttClient.subscribe((String(DEVICE_ID) + "/config").c_str(), 1);
+           mqttClient.subscribe((String(DEVICE_ID) + "/readings").c_str(), 1);
+       } else {
+           Serial.print("failed, rc=");
+           Serial.print(mqttClient.state());
+           Serial.println(" try again in 5 seconds");
+           delay(5000);
+       }
+   }
+}
+
+void setup() {
+   Serial.begin(115200);
+   Serial.println(DEVICE_ID);
+   
+   setupWatchdog();
+   
+   wifiManager.setAPCallback(configModeCallback);
+   wifiManager.setSaveConfigCallback(saveConfigCallback);
+   wifiManager.setConfigPortalTimeout(180);
+   
+   if (!wifiManager.autoConnect("GrowaAP")) {
+       Serial.println("Failed to connect and hit timeout");
+       delay(3000);
+       ESP.restart();
+       delay(5000);
+   }
+   
+   Serial.println("WiFi connected");
+   Serial.println("IP address: ");
+   Serial.println(WiFi.localIP());
+   
+   initMCP23017();
+   
+   espClient.setInsecure();
+   mqttClient.setServer(mqtt_server, mqtt_port);
+   mqttClient.setCallback(callback);
+   
+   pinMode(PULSE_PINS[0], INPUT_PULLUP);
+   pinMode(PULSE_PINS[1], INPUT_PULLUP);
+   
+   attachInterrupt(digitalPinToInterrupt(PULSE_PINS[0]), pulse1_isr, FALLING);
+   attachInterrupt(digitalPinToInterrupt(PULSE_PINS[1]), pulse2_isr, FALLING);
+}
+
 void loop() {
-    // Reset watchdog at start of loop
-    esp_task_wdt_reset();
-    
-    if (!mqttClient.connected()) {
-        connectMQTT();
-    }
-    mqttClient.loop();
-    
-    // Handle periodic sensor readings
-    if (millis() - lastReading >= readingInterval) {
-        digitalWrite(RELAY_5V_PIN, HIGH);
-        digitalWrite(RELAY_3V3_PIN, HIGH);
-        delay(100);
-        
-        readSensors();
-        
-        digitalWrite(RELAY_5V_PIN, LOW);
-        digitalWrite(RELAY_3V3_PIN, LOW);
-        lastReading = millis();
-        
-        esp_task_wdt_reset();  // Reset after readings complete
-    }
-    
-    // Handle MCP watchdog
-    handleMCPWatchdog();
-    
-    // Handle LED status indicator
-    static uint32_t lastBlink = 0;
-    if (millis() - lastBlink >= 1000) {
-        if(mcpResponding) {
-            mcp.digitalWrite(LED_BLINK_PIN, !mcp.digitalRead(LED_BLINK_PIN));
-        } else {
-            mcp.digitalWrite(LED_BLINK_PIN, LOW);
-        }
-        lastBlink = millis();
-    }
-    
-    // Reset watchdog at end of loop if all operations completed successfully
-    esp_task_wdt_reset();
+   feedWatchdog();
+   
+   if (!mqttClient.connected()) {
+       reconnect();
+   }
+   mqttClient.loop();
+   handleMCPBlink();
+   
+   unsigned long now = millis();
+   if (now - lastMsg > 5000) {
+       ADCReading();
+       PULSEReading();
+       MCPReading();
+       lastMsg = now;
+       ++counter;    
+       Serial.println("Cycle " + String(counter));
+   }
 }
