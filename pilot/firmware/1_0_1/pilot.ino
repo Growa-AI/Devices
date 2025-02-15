@@ -307,44 +307,50 @@ void handleMCPBlink() {
 
 // SYS reading functions
 void SYSReading() {
-   char outputBuffer[100];   
-   char tempBuffer[20];      
-   const char type[] = "0x00";
-   const char address = '0';
-   
-   // Inizia con type, address e numero di valori
-   sprintf(outputBuffer, "%s+%c+4", type, address);
+    char outputBuffer[100];   
+    char tempBuffer[20];      
+    const char type[] = "0x00";
+    const char address = '0';
+    
+    // Inizia con type, address e numero di valori
+    sprintf(outputBuffer, "%s+%c+4", type, address);
 
-   // Aggiungi FIRMWARE_VERSION
-   strcat(outputBuffer, "+");
-   strcat(outputBuffer, FIRMWARE_VERSION);
+    // Aggiungi FIRMWARE_VERSION
+    strcat(outputBuffer, "+");
+    strcat(outputBuffer, FIRMWARE_VERSION);
 
-   // Aggiungi voltaggio batteria
-   float voltage = analogRead(BATTERY_PIN) * 20.0 / 4095.0;
-   dtostrf(voltage, 1, 2, tempBuffer);
-   strcat(outputBuffer, "+");
-   strcat(outputBuffer, tempBuffer);
+    // Aggiungi voltaggio batteria
+    float voltage = analogRead(BATTERY_PIN) * 20.0 / 4095.0;
+    dtostrf(voltage, 1, 2, tempBuffer);
+    char* voltPtr = tempBuffer;
+    while(*voltPtr == ' ') voltPtr++;
+    strcat(outputBuffer, "+");
+    strcat(outputBuffer, voltPtr);
 
-   // Aggiungi RSSI (forza del segnale WiFi)
-   sprintf(tempBuffer, "%d", WiFi.RSSI());
-   strcat(outputBuffer, "+");
-   strcat(outputBuffer, tempBuffer);
+    // Aggiungi RSSI (sempre negativo, senza +)
+    int rssi = WiFi.RSSI();
+    if(rssi > 0) rssi = -rssi;
+    sprintf(tempBuffer, "%d", rssi);
+    strcat(outputBuffer, tempBuffer);  // Nota: niente + prima del valore negativo
 
-   // Aggiungi nome WiFi
-   const char* wifiName = WiFi.SSID().c_str();
-   strcat(outputBuffer, "+");
-   strcat(outputBuffer, wifiName);
-   
-   // Debug print
-   Serial.print("System status: ");
-   Serial.println(outputBuffer);
+    // Aggiungi nome WiFi
+    String ssid = WiFi.SSID();
+    if(ssid.length() == 0) {
+        ssid = "unknown";
+    }
+    strcat(outputBuffer, "+");
+    strcat(outputBuffer, ssid.c_str());
+    
+    // Debug print
+    Serial.print("System status: ");
+    Serial.println(outputBuffer);
 
-   mqttClient.publish(
-       (String(DEVICE_ID) + "/readings").c_str(),            
-       (const uint8_t*)outputBuffer, 
-       strlen(outputBuffer), 
-       true
-   );
+    mqttClient.publish(
+        (String(DEVICE_ID) + "/readings").c_str(),            
+        (const uint8_t*)outputBuffer, 
+        strlen(outputBuffer), 
+        true
+    );
 }
 
 // Sensor reading functions
