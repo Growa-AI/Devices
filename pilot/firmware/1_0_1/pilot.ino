@@ -365,6 +365,9 @@ void PULSEReading() {
 #include <HTTPClient.h>
 #include <Update.h>
 
+#define MAX_URL_LENGTH 512
+#define MIN_URL_LENGTH 30
+
 bool performOTA(const char* url) {
     HTTPClient http;
     bool success = false;
@@ -460,6 +463,43 @@ bool performOTA(const char* url) {
     return true;
 }
 
+void handleOTAUpdate(const char* url) {
+    size_t urlLength = strlen(url);
+    
+    // Verifica lunghezza URL
+    if(urlLength < MIN_URL_LENGTH || urlLength > MAX_URL_LENGTH) {
+        char errorMsg[64];
+        snprintf(errorMsg, sizeof(errorMsg), "URL length invalid (%d chars)", urlLength);
+        mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), errorMsg, true);
+        return;
+    }
+
+    // Verifica che l'URL sia raw.githubusercontent.com
+    if(strncmp(url, "https://raw.githubusercontent.com/", 33) != 0) {
+        mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
+                          "Invalid URL - must be raw.githubusercontent.com", true);
+        return;
+    }
+
+    Serial.print("Starting OTA from URL: ");
+    Serial.println(url);
+
+    mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
+                       "OTA update started", true);
+
+    bool success = performOTA(url);
+    
+    if(success) {
+        mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
+                         "OTA update successful - rebooting", true);
+        delay(1000);
+        ESP.restart();
+    } else {
+        mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
+                         "OTA update failed", true);
+    }
+}
+
 // MQTT functions
 void callback(char* topic, byte* payload, unsigned int length) {
     Serial.print("Message arrived [");
@@ -481,45 +521,31 @@ void callback(char* topic, byte* payload, unsigned int length) {
         }
     }
     else if(topicStr == systemTopic) {
-        // Buffer per il comando
-        char command[256] = {0};
-        if(length < sizeof(command)) {
+        char* command = (char*)malloc(MAX_URL_LENGTH + 10);
+        if(!command) {
+            mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
+                             "Memory allocation failed", true);
+            return;
+        }
+
+        if(length < MAX_URL_LENGTH + 10) {
+            memset(command, 0, MAX_URL_LENGTH + 10);
             memcpy(command, payload, length);
             command[length] = 0;
             
             if(strcmp(command, "reset") == 0) {
+                free(command);
                 ESP.restart();
             }
             else if(strncmp(command, "ota:", 4) == 0) {
-                // Estrai l'URL dopo "ota:"
-                char* url = command + 4;
-                
-                // Verifica che l'URL inizi con https://
-                if(strncmp(url, "https://", 8) == 0) {
-                    // Pubblica stato iniziale
-                    mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
-                                     "OTA update started", true);
-                    
-                    // Esegui l'update
-                    bool success = performOTA(url);
-                    
-                    if(success) {
-                        // Pubblica successo e riavvia
-                        mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
-                                         "OTA update successful - rebooting", true);
-                        delay(1000);  // Attendi che il messaggio venga inviato
-                        ESP.restart();
-                    } else {
-                        // Pubblica errore
-                        mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
-                                         "OTA update failed", true);
-                    }
-                } else {
-                    mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
-                                     "Invalid OTA URL - must use HTTPS", true);
-                }
+                handleOTAUpdate(command + 4);
             }
+        } else {
+            mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
+                             "Command too long", true);
         }
+        
+        free(command);
     }
 }
 
