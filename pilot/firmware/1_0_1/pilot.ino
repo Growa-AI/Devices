@@ -305,6 +305,48 @@ void handleMCPBlink() {
     }
 }
 
+// SYS reading functions
+void SYSReading() {
+   char outputBuffer[100];   
+   char tempBuffer[20];      
+   const char type[] = "0x00";
+   const char address = '0';
+   
+   // Inizia con type, address e numero di valori
+   sprintf(outputBuffer, "%s+%c+4", type, address);
+
+   // Aggiungi FIRMWARE_VERSION
+   strcat(outputBuffer, "+");
+   strcat(outputBuffer, FIRMWARE_VERSION);
+
+   // Aggiungi voltaggio batteria
+   float voltage = analogRead(BATTERY_PIN) * 20.0 / 4095.0;
+   dtostrf(voltage, 1, 2, tempBuffer);
+   strcat(outputBuffer, "+");
+   strcat(outputBuffer, tempBuffer);
+
+   // Aggiungi RSSI (forza del segnale WiFi)
+   sprintf(tempBuffer, "%d", WiFi.RSSI());
+   strcat(outputBuffer, "+");
+   strcat(outputBuffer, tempBuffer);
+
+   // Aggiungi nome WiFi
+   const char* wifiName = WiFi.SSID().c_str();
+   strcat(outputBuffer, "+");
+   strcat(outputBuffer, wifiName);
+   
+   // Debug print
+   Serial.print("System status: ");
+   Serial.println(outputBuffer);
+
+   mqttClient.publish(
+       (String(DEVICE_ID) + "/readings").c_str(),            
+       (const uint8_t*)outputBuffer, 
+       strlen(outputBuffer), 
+       true
+   );
+}
+
 // Sensor reading functions
 void ADCReading() {
     char outputBuffer[50];    
@@ -368,99 +410,135 @@ void PULSEReading() {
 #define MAX_URL_LENGTH 512
 #define MIN_URL_LENGTH 30
 
-bool performOTA(const char* url) {
-    HTTPClient http;
-    bool success = false;
-    
-    Serial.printf("Starting OTA from: %s\n", url);
-    
-    // Configura il timeout
-    http.setTimeout(12000);  // 12 secondi di timeout
-    
-    if (!http.begin(url)) {
-        Serial.println("Failed to connect to update server");
-        return false;
-    }
-    
-    // Get del file
-    int httpCode = http.GET();
-    if (httpCode != HTTP_CODE_OK) {
-        Serial.printf("HTTP GET failed, error: %d\n", httpCode);
-        http.end();
-        return false;
-    }
-    
-    // Ottieni la dimensione del file
-    int contentLength = http.getSize();
-    if (contentLength <= 0) {
-        Serial.println("Invalid content length");
-        http.end();
-        return false;
-    }
-    
-    Serial.printf("OTA file size: %d bytes\n", contentLength);
-    
-    // Prepara l'update
-    if (!Update.begin(contentLength)) {
-        Serial.printf("Not enough space for update: %s\n", Update.errorString());
-        http.end();
-        return false;
-    }
-    
-    // Download e scrittura in flash
-    WiFiClient *stream = http.getStreamPtr();
-    size_t written = 0;
-    uint8_t buff[1024] = {0};
-    
-    while (http.connected() && written < contentLength) {
-        // Feed watchdog durante il processo
-        feedWatchdog();
-        
-        // Leggi un chunk
-        size_t len = stream->available();
-        if (len > 0) {
-            // Non leggere più di quanto possiamo gestire
-            if (len > sizeof(buff)) len = sizeof(buff);
-            
-            // Leggi nel buffer
-            int bytesRead = stream->readBytes(buff, len);
-            if (bytesRead < 0) {
-                Serial.println("Read error");
-                break;
-            }
-            
-            // Scrivi in flash
-            if (Update.write(buff, bytesRead) != bytesRead) {
-                Serial.printf("Write failed: %s\n", Update.errorString());
-                break;
-            }
-            
-            written += bytesRead;
-            
-            // Stampa progresso
-            Serial.printf("OTA Progress: %d%%\n", (written * 100) / contentLength);
-        }
-        delay(1);  // Yield per il watchdog e altri task
-    }
-    
-    // Verifica che tutto sia stato scritto
-    if (written != contentLength) {
-        Serial.println("Write incomplete");
-        Update.abort();
-        http.end();
-        return false;
-    }
-    
-    // Finalizza l'update
-    if (!Update.end(true)) {
-        Serial.printf("Update end failed: %s\n", Update.errorString());
-        http.end();
-        return false;
-    }
-    
-    http.end();
-    Serial.println("OTA Update successful!");
-    return true;
+bool performOTA(const char* url, int maxRetries = 3) {
+   HTTPClient http;
+   bool success = false;
+   
+   Serial.printf("Starting OTA from: %s\n", url);
+   mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), "OTA update started", true);
+   
+   // Configura il timeout
+   http.setTimeout(12000);  // 12 secondi di timeout
+   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+   
+   if (!http.begin(url)) {
+       mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
+                         "Failed to connect to update server", true);
+       return false;
+   }
+   
+   // Get del file
+   int httpCode = http.GET();
+   if (httpCode != HTTP_CODE_OK) {
+       char errorMsg[100];
+       snprintf(errorMsg, sizeof(errorMsg), "HTTP GET failed, error: %d", httpCode);
+       mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), errorMsg, true);
+       http.end();
+       return false;
+   }
+   
+   // Ottieni la dimensione del file
+   int contentLength = http.getSize();
+   if (contentLength <= 0) {
+       mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
+                         "Invalid file size", true);
+       http.end();
+       return false;
+   }
+   
+   Serial.printf("OTA file size: %d bytes\n", contentLength);
+   mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
+                      String("File size: " + String(contentLength) + " bytes").c_str(), true);
+   
+   // Prepara l'update
+   if (!Update.begin(contentLength)) {
+       char errorMsg[100];
+       snprintf(errorMsg, sizeof(errorMsg), "Not enough space: %s", Update.errorString());
+       mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), errorMsg, true);
+       http.end();
+       return false;
+   }
+   
+   // Download e scrittura in flash
+   WiFiClient *stream = http.getStreamPtr();
+   size_t written = 0;
+   uint8_t buff[1024] = {0};
+   
+   while (http.connected() && written < contentLength) {
+       // Feed watchdog durante il processo
+       feedWatchdog();
+       
+       // Leggi un chunk
+       size_t len = stream->available();
+       if (len > 0) {
+           // Non leggere più di quanto possiamo gestire
+           if (len > sizeof(buff)) len = sizeof(buff);
+           
+           // Leggi nel buffer
+           int bytesRead = stream->readBytes(buff, len);
+           if (bytesRead < 0) {
+               mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
+                                "Read error", true);
+               http.end();
+               return false;
+           }
+           
+           // Scrivi in flash
+           if (Update.write(buff, bytesRead) != bytesRead) {
+               char errorMsg[100];
+               snprintf(errorMsg, sizeof(errorMsg), 
+                       "Write failed at %d%%: %s", 
+                       (written * 100) / contentLength,
+                       Update.errorString());
+               mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
+                                errorMsg, true);
+               http.end();
+               return false;
+           }
+           
+           written += bytesRead;
+           
+           // Stampa progresso ogni 10%
+           static int lastPercent = 0;
+           int currentPercent = (written * 100) / contentLength;
+           if(currentPercent / 10 > lastPercent / 10) {
+               char progressMsg[32];
+               snprintf(progressMsg, sizeof(progressMsg), 
+                       "OTA Progress: %d%%", currentPercent);
+               mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
+                                progressMsg, true);
+               Serial.println(progressMsg);
+               lastPercent = currentPercent;
+           }
+       }
+       delay(1);  // Yield per il watchdog e altri task
+   }
+   
+   // Verifica che tutto sia stato scritto
+   if (written != contentLength) {
+       char errorMsg[100];
+       snprintf(errorMsg, sizeof(errorMsg), 
+               "Write incomplete: %d of %d bytes", written, contentLength);
+       mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), errorMsg, true);
+       Update.abort();
+       http.end();
+       return false;
+   }
+   
+   // Finalizza l'update
+   if (!Update.end(true)) {
+       char errorMsg[100];
+       snprintf(errorMsg, sizeof(errorMsg), 
+               "Update finalization failed: %s", Update.errorString());
+       mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), errorMsg, true);
+       http.end();
+       return false;
+   }
+   
+   http.end();
+   mqttClient.publish((String(DEVICE_ID) + "/status").c_str(), 
+                      "OTA Update successful!", true);
+   return true;
 }
 
 void handleOTAUpdate(const char* url) {
@@ -626,6 +704,7 @@ void loop() {
             initMCP23017();
         }
         
+        SYSReading();
         ADCReading();
         PULSEReading();
         MCPReading();
