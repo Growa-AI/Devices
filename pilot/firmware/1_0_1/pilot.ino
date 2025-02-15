@@ -10,8 +10,8 @@
 // MQTT configuration
 const char* mqtt_server = "mqtt.growa.ai";
 const int mqtt_port = 8883;
-const char* mqtt_user = "mqttroot";
-const char* mqtt_password = "k<V<k3:n73mQCF7";
+const char* mqtt_user = "";
+const char* mqtt_password = "";
 
 // Device configuration
 #define DEVICE_ID "0001"
