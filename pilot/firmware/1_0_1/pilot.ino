@@ -15,7 +15,7 @@ const char* mqtt_password = "";
 
 // Device configuration
 #define DEVICE_ID "0001"
-#define FIRMWARE_VERSION "1.0.1"
+#define FIRMWARE_VERSION "P.1.0.1"
 
 // Hardware pins
 #define BATTERY_PIN 32
