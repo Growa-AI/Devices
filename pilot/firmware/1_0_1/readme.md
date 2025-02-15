@@ -1,4 +1,4 @@
-# Firmware 1.0.1
+# Firmware P.1.0.1
 
 This firmware is designed for an ESP32-based controller that interfaces with various sensors and relays through an MCP23017 I/O expander. It provides MQTT connectivity for remote monitoring and control of agricultural systems.
 
